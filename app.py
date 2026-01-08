@@ -7,37 +7,30 @@ from difflib import get_close_matches
 
 # --- 1. DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect('price_monitor_v8.db', check_same_thread=False)
+    conn = sqlite3.connect('price_monitor_v9.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
-    # Added "is_bought" column
     c.execute('''CREATE TABLE IF NOT EXISTS products 
                  (id INTEGER PRIMARY KEY, name TEXT, description TEXT, 
-                  category_id INTEGER, is_bought INTEGER DEFAULT 0)''')
-    # Listings table remains for current prices
+                  category_id INTEGER, target_price REAL DEFAULT 0, is_bought INTEGER DEFAULT 0)''')
     c.execute('''CREATE TABLE IF NOT EXISTS listings 
                  (id INTEGER PRIMARY KEY, product_id INTEGER, shop_name TEXT, 
                   price REAL, url TEXT, last_updated TEXT)''')
-    # NEW: History table for the Graph
     c.execute('''CREATE TABLE IF NOT EXISTS history 
                  (id INTEGER PRIMARY KEY, product_id INTEGER, shop_name TEXT, 
                   price REAL, date TEXT)''')
     conn.commit()
     return conn
 
-def get_incoming_data():
-    params = st.query_params
-    return {"name": params.get("name", ""), "url": params.get("url", ""), "price": params.get("price", "0")}
-
-# --- 2. UI CONFIG ---
-st.set_page_config(page_title="PricePro Buyer", layout="wide")
+# --- 2. LOGIC ---
 conn = init_db()
-inc = get_incoming_data()
+st.set_page_config(page_title="PricePro Personal", layout="wide")
 
-try:
-    clean_p = float(re.search(r"[\d,.]+", inc['price']).group().replace(',', ''))
-except:
-    clean_p = 0.0
+inc = {
+    "name": st.query_params.get("name", ""),
+    "url": st.query_params.get("url", ""),
+    "price": st.query_params.get("price", "0")
+}
 
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "➕ Add/Update Listing", "📁 Categories"])
 
@@ -67,91 +60,87 @@ with tab2:
     if target_prod == "(Create New Product)":
         col1, col2 = st.columns(2)
         prod_name = col1.text_input("Master Product Name", value=inc['name'])
-        prod_desc = col1.text_area("Notes")
+        target_val = col1.number_input("Target Price (Buy when it hits this)", value=0.0)
+        prod_desc = col2.text_area("Notes")
         cats = pd.read_sql_query("SELECT * FROM categories", conn)
-        cat_map = dict(zip(cats['name'], cats['id']))
-        cat_id = cat_map.get(col2.selectbox("Category", options=list(cat_map.keys()) if not cats.empty else ["Add Category First"]))
+        cat_id = pd.read_sql_query(f"SELECT id FROM categories WHERE name='{col2.selectbox('Category', options=cats['name'].tolist() if not cats.empty else ['None'])}'", conn).iloc[0][0] if not cats.empty else None
     else:
         p_info = prods_df[prods_df['id'] == prod_map[target_prod]].iloc[0]
-        prod_name, cat_id = p_info['name'], p_info['category_id']
+        prod_name = p_info['name']
+        target_val = p_info['target_price']
 
     st.divider()
-    c_a, c_b, c_c = st.columns([1, 2, 1])
-    store = c_a.text_input("Store Name", value="Lazada" if "lazada" in inc['url'].lower() else "Shopee" if "shopee" in inc['url'].lower() else "Shop")
-    link = c_b.text_input("URL", value=inc['url'])
-    price = c_c.number_input("Price", value=clean_p)
+    ca, cb, cc = st.columns([1, 2, 1])
+    store = ca.text_input("Store Name", value="Lazada" if "lazada" in inc['url'].lower() else "Shopee" if "shopee" in inc['url'].lower() else "Shop")
+    link = cb.text_input("URL", value=inc['url'])
+    # Parse incoming price string safely
+    try: p_val = float(re.sub(r'[^\d.]', '', inc['price'].replace(',','')))
+    except: p_val = 0.0
+    price = cc.number_input("Current Price", value=p_val)
     
-    if st.button("🚀 Save and Log Price"):
+    if st.button("🚀 Save and Update Dashboard"):
         today = datetime.now().strftime("%Y-%m-%d")
         c = conn.cursor()
         if target_prod == "(Create New Product)":
-            c.execute("INSERT INTO products (name, description, category_id) VALUES (?, ?, ?)", (prod_name, prod_desc, cat_id))
+            c.execute("INSERT INTO products (name, description, category_id, target_price) VALUES (?, ?, ?, ?)", (prod_name, prod_desc, cat_id, target_val))
             p_id = c.lastrowid
         else:
             p_id = prod_map[target_prod]
             
-        # Update current listing
         c.execute("INSERT OR REPLACE INTO listings (product_id, shop_name, price, url, last_updated) VALUES (?,?,?,?,?)", (p_id, store, price, link, today))
-        # Log to history for the graph
         c.execute("INSERT INTO history (product_id, shop_name, price, date) VALUES (?,?,?,?)", (p_id, store, price, today))
-        
         conn.commit()
-        st.success("Price Logged!")
-        st.query_params.clear()
+        st.success("Updated!")
 
 # --- TAB 1: DASHBOARD ---
 with tab1:
-    col_s1, col_s2 = st.columns([2,1])
-    search = col_s1.text_input("🔍 Search Active Items...")
-    show_bought = col_s2.checkbox("Show Bought Items")
+    # 1. SUMMARY STATS
+    all_active = pd.read_sql_query("""
+        SELECT MIN(l.price) as best, MAX(l.price) as worst 
+        FROM listings l JOIN products p ON l.product_id = p.id 
+        WHERE p.is_bought=0 GROUP BY p.id""", conn)
     
-    status_filter = 1 if show_bought else 0
-    query = f"SELECT p.*, c.name as cat_name FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.is_bought={status_filter}"
+    bought_data = pd.read_sql_query("SELECT MIN(price) as spent FROM listings JOIN products ON listings.product_id = products.id WHERE products.is_bought=1 GROUP BY products.id", conn)
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Total Watchlist Value", f"₱{all_active['best'].sum():,.2f}")
+    s2.metric("Money Saved (vs Max)", f"₱{(all_active['worst'] - all_active['best']).sum():,.2f}")
+    s3.metric("Total Already Spent", f"₱{bought_data['spent'].sum():,.2f}")
+    st.divider()
+
+    # 2. PRODUCT LIST
+    search = st.text_input("🔍 Search Active Items...")
+    show_bought = st.checkbox("Show Purchased History")
+    
+    status = 1 if show_bought else 0
+    query = f"SELECT p.*, c.name as cat_name FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.is_bought={status}"
     if search: query += f" AND p.name LIKE '%{search}%'"
     
-    display_df = pd.read_sql_query(query, conn)
+    prods = pd.read_sql_query(query, conn)
     
-    for i, prod in display_df.iterrows():
+    for _, prod in prods.iterrows():
         with st.container(border=True):
             h1, h2, h3 = st.columns([4, 1, 1])
             h1.subheader(f"{'✅ ' if show_bought else ''}{prod['name']}")
             h1.caption(f"{prod['cat_name']} | {prod['description']}")
             
             if not show_bought:
-                if h2.button("✔️ Mark Bought", key=f"buy_{prod['id']}"):
-                    conn.execute(f"UPDATE products SET is_bought=1 WHERE id={prod['id']}")
-                    conn.commit()
-                    st.rerun()
+                if h2.button("✔️ Bought", key=f"b_{prod['id']}"):
+                    conn.execute(f"UPDATE products SET is_bought=1 WHERE id={prod['id']}"); conn.commit(); st.rerun()
             
-            if h3.button("🗑️ Delete", key=f"del_{prod['id']}"):
-                conn.execute(f"DELETE FROM products WHERE id={prod['id']}")
-                conn.execute(f"DELETE FROM listings WHERE product_id={prod['id']}")
-                conn.execute(f"DELETE FROM history WHERE product_id={prod['id']}")
-                conn.commit()
-                st.rerun()
+            if h3.button("🗑️ Del", key=f"d_{prod['id']}"):
+                conn.execute(f"DELETE FROM products WHERE id={prod['id']}"); conn.commit(); st.rerun()
             
-            # List current prices
             l_df = pd.read_sql_query(f"SELECT * FROM listings WHERE product_id={prod['id']} ORDER BY price ASC", conn)
             if not l_df.empty:
-                # Calculate Price Difference
-                best_p = l_df.iloc[0]['price']
-                worst_p = l_df.iloc[-1]['price']
-                diff = worst_p - best_p
-                
-                if diff > 0:
-                    st.info(f"💡 You save **₱{diff:,.2f}** by picking the cheapest store.")
-                
-                for _, lst in l_df.iterrows():
-                    l1, l2, l3, l4 = st.columns([2, 1, 2, 1])
-                    l1.write(f"🏪 {lst['shop_name']}")
-                    l2.write(f"₱{lst['price']:,.2f}")
-                    l3.write(f"📅 {lst['last_updated']}")
-                    l4.link_button("Link", lst['url'])
+                # Target Price Logic
+                best = l_df.iloc[0]['price']
+                if prod['target_price'] > 0 and best <= prod['target_price']:
+                    st.success(f"🎯 TARGET MET: Price is below your ₱{prod['target_price']:,.2f} goal!")
 
-                # --- THE GRAPH ---
-                st.write("**Price History Over Time**")
+                # Listings and Graph
+                st.dataframe(l_df[['shop_name', 'price', 'last_updated']], hide_index=True, use_container_width=True)
+                
                 h_df = pd.read_sql_query(f"SELECT date, price, shop_name FROM history WHERE product_id={prod['id']} ORDER BY date ASC", conn)
-                if not h_df.empty:
-                    # Pivoting data for the line chart
-                    chart_data = h_df.pivot_table(index='date', columns='shop_name', values='price')
-                    st.line_chart(chart_data)
+                if len(h_df) > 1:
+                    st.line_chart(h_df.pivot_table(index='date', columns='shop_name', values='price'))
