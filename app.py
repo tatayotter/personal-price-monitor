@@ -26,6 +26,8 @@ def init_db():
 def scrape_data(url):
     options = Options()
     options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     
