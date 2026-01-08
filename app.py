@@ -25,10 +25,16 @@ def init_db():
 # --- 2. MULTI-LINK SCRAPER ---
 def scrape_multi_prices(urls_string):
     options = Options()
+    # These 5 lines are MANDATORY for Streamlit Cloud
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.add_argument("--disable-gpu")
+    options.binary_location = "/usr/bin/chromium-browser" # Points to the cloud's browser
+    
+    # Updated driver setup for the cloud environment
+    service = Service("/usr/bin/chromedriver") 
+    driver = webdriver.Chrome(service=service, options=options)
     
     urls = [url.strip() for url in urls_string.split(",")]
     results = []
@@ -38,14 +44,15 @@ def scrape_multi_prices(urls_string):
         try:
             driver.get(url)
             time.sleep(5)
-            # Find Price
+            # Standard price selector
             price_el = driver.find_element(By.CSS_SELECTOR, ".pdp-price, ._3e_ne, [data-testid='price']")
             price = float(''.join(filter(str.isdigit, price_el.text)))
             
-            # Grab image from the first successful link
             if main_image == "https://via.placeholder.com/150":
-                img_el = driver.find_element(By.CSS_SELECTOR, ".pdp-mod-common-gallery-viewer img, .gallery-preview-panel img")
-                main_image = img_el.get_attribute("src")
+                try:
+                    img_el = driver.find_element(By.CSS_SELECTOR, ".pdp-mod-common-gallery-viewer img, .gallery-preview-panel img")
+                    main_image = img_el.get_attribute("src")
+                except: pass
             
             results.append({"price": price, "url": url})
         except:
