@@ -6,14 +6,22 @@ from datetime import datetime
 from difflib import get_close_matches
 
 # --- 1. DATABASE SETUP ---
+@st.cache_resource
+def get_connection():
+    # Using a new DB version name to ensure schema updates apply
+    conn = sqlite3.connect('price_monitor_v20.db', check_same_thread=False)
+    return conn
+
 def init_db():
-    conn = sqlite3.connect('price_monitor_v19.db', check_same_thread=False)
+    conn = get_connection()
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
+    # Added image_url column to the products table
     c.execute('''CREATE TABLE IF NOT EXISTS products 
                  (id INTEGER PRIMARY KEY, name TEXT, description TEXT, 
                   category_id INTEGER, target_price REAL DEFAULT 0, 
-                  is_bought INTEGER DEFAULT 0, final_paid REAL DEFAULT 0, shipping_fee REAL DEFAULT 0)''')
+                  is_bought INTEGER DEFAULT 0, final_paid REAL DEFAULT 0, 
+                  shipping_fee REAL DEFAULT 0, image_url TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS listings 
                  (id INTEGER PRIMARY KEY, product_id INTEGER, shop_name TEXT, 
                   price REAL, url TEXT, last_updated TEXT)''')
@@ -25,10 +33,11 @@ def init_db():
     for cat in default_cats:
         c.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
     conn.commit()
-    return conn
 
-conn = init_db()
-st.set_page_config(page_title="PricePro v19", layout="wide", page_icon="💰")
+init_db()
+conn = get_connection()
+
+st.set_page_config(page_title="PricePro v20", layout="wide", page_icon="💰")
 
 # --- 2. CAPTURE URL PARAMETERS ---
 params = st.query_params
@@ -51,9 +60,12 @@ if page == "📁 Categories":
     c_add1, c_add2 = st.columns([3, 1])
     new_cat = c_add1.text_input("New Category Name")
     if c_add2.button("➕ Add", use_container_width=True) and new_cat:
-        conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (new_cat,))
-        conn.commit()
-        st.rerun()
+        try:
+            conn.execute("INSERT INTO categories (name) VALUES (?)", (new_cat,))
+            conn.commit()
+            st.rerun()
+        except sqlite3.IntegrityError:
+            st.error("Category already exists!")
     
     st.divider()
     cats_df = pd.read_sql_query("SELECT * FROM categories", conn)
@@ -61,10 +73,11 @@ if page == "📁 Categories":
         c_col1, c_col2 = st.columns([3, 1])
         c_col1.write(f"📁 {row['name']}")
         if c_col2.button("🗑️ Remove", key=f"cat_del_{row['id']}", use_container_width=True):
-            usage = pd.read_sql_query(f"SELECT id FROM products WHERE category_id={row['id']}", conn)
-            if not usage.empty: st.error("Category in use!")
+            usage = pd.read_sql_query("SELECT id FROM products WHERE category_id=?", conn, params=(row['id'],))
+            if not usage.empty: 
+                st.error("Category in use!")
             else: 
-                conn.execute(f"DELETE FROM categories WHERE id={row['id']}")
+                conn.execute("DELETE FROM categories WHERE id=?", (row['id'],))
                 conn.commit()
                 st.rerun()
 
@@ -72,20 +85,18 @@ if page == "📁 Categories":
 elif page == "➕ Add/Update Listing":
     st.header("Add or Update Listing")
 
-    # Image and Summary Preview Container
     if inc['img'] or inc['name']:
         with st.container(border=True):
             col_img, col_txt = st.columns([1, 4])
             if inc['img']:
-                col_img.image(inc['img'], use_container_width=True)
-            col_txt.markdown(f"**Extracted Product:**\n{inc['name']}")
+                col_img.image(inc['img'], width=150)
+            col_txt.markdown(f"**Incoming Product:**\n{inc['name']}")
             if inc['url']:
                 col_txt.caption(f"Source: {inc['url']}")
 
     prods_df = pd.read_sql_query("SELECT * FROM products WHERE is_bought=0", conn)
     prod_map = dict(zip(prods_df['name'], prods_df['id']))
     
-    # Fuzzy match logic
     matches = get_close_matches(inc['name'], list(prod_map.keys()), n=1, cutoff=0.2) if inc['name'] and prod_map else []
     best_match = matches[0] if matches else None
 
@@ -100,7 +111,7 @@ elif page == "➕ Add/Update Listing":
         cats = pd.read_sql_query("SELECT * FROM categories", conn)
         cat_options = cats['name'].tolist() if not cats.empty else ["None"]
         cat_selection = col2.selectbox("Category", options=cat_options)
-        cat_id = pd.read_sql_query(f"SELECT id FROM categories WHERE name='{cat_selection}'", conn).iloc[0][0] if not cats.empty else None
+        cat_id = cats[cats['name'] == cat_selection]['id'].values[0] if not cats.empty else None
     else:
         p_info = prods_df[prods_df['id'] == prod_map[target_prod]].iloc[0]
         prod_name, target_val = p_info['name'], p_info['target_price']
@@ -119,25 +130,24 @@ elif page == "➕ Add/Update Listing":
     
     price = cc.number_input("Current Price", value=p_val, min_value=0.0, step=0.01)
 
-    if price <= 0:
-        st.warning("⚠️ Price must be greater than zero to save.")
-        save_disabled = True
-    else:
-        save_disabled = False
-    
-    if st.button("🚀 Save Listing", disabled=save_disabled, use_container_width=True):
+    if st.button("🚀 Save Listing", disabled=(price <= 0), use_container_width=True):
         today = datetime.now().strftime("%Y-%m-%d")
         c = conn.cursor()
         if target_prod == "(Create New Product)":
-            c.execute("INSERT INTO products (name, description, category_id, target_price) VALUES (?, ?, ?, ?)", (prod_name, prod_desc, cat_id, target_val))
+            c.execute("INSERT INTO products (name, description, category_id, target_price, image_url) VALUES (?, ?, ?, ?, ?)", 
+                      (prod_name, prod_desc, cat_id, target_val, inc['img']))
             p_id = c.lastrowid
-        else: p_id = prod_map[target_prod]
+        else: 
+            p_id = prod_map[target_prod]
+            # Update image if existing product doesn't have one
+            c.execute("UPDATE products SET image_url = COALESCE(image_url, ?) WHERE id = ?", (inc['img'], p_id))
         
         c.execute("INSERT OR REPLACE INTO listings (product_id, shop_name, price, url, last_updated) VALUES (?,?,?,?,?)", (p_id, store, price, link, today))
         c.execute("INSERT INTO history (product_id, shop_name, price, date) VALUES (?,?,?,?)", (p_id, store, price, today))
         conn.commit()
         st.success(f"Successfully saved {prod_name}!")
         st.query_params.clear()
+        st.rerun()
 
 # --- PAGE: DASHBOARD ---
 elif page == "📊 Dashboard":
@@ -145,47 +155,72 @@ elif page == "📊 Dashboard":
     total_spent = (bought_df['final_paid'] + bought_df['shipping_fee']).sum()
     v_savings = (bought_df['last_list'] - bought_df['final_paid']).sum()
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3 = st.columns(3)
     s1.metric("Spent (Total)", f"₱{total_spent:,.2f}")
     s2.metric("Voucher Savings", f"₱{max(0, v_savings):,.2f}")
     st.divider()
 
     search = st.text_input("🔍 Search Dashboard...")
     show_bought = st.checkbox("Show Purchased Archive")
-    prods = pd.read_sql_query(f"SELECT p.*, c.name as cat_name FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.is_bought={1 if show_bought else 0} AND p.name LIKE '%{search}%'", conn)
+    
+    status = 1 if show_bought else 0
+    query = """SELECT p.*, c.name as cat_name 
+               FROM products p 
+               LEFT JOIN categories c ON p.category_id = c.id 
+               WHERE p.is_bought=? AND p.name LIKE ?"""
+    prods = pd.read_sql_query(query, conn, params=(status, f'%{search}%'))
     
     for _, prod in prods.iterrows():
         with st.container(border=True):
-            h1, h_edit, h2, h3 = st.columns([4, 0.8, 1, 1])
-            h1.subheader(f"{'✅ ' if show_bought else ''}{prod['name']}")
-            h1.caption(f"{prod['cat_name']} | {prod['description']}")
+            # Layout: Image | Details | Actions
+            col_img, col_main, col_btns = st.columns([1, 4, 1.2])
             
-            with h_edit.popover("📝"):
-                new_name = st.text_input("Edit Name", value=prod['name'], key=f"ed_n_{prod['id']}")
-                if st.button("Save", key=f"s_n_{prod['id']}"):
-                    conn.execute("UPDATE products SET name=? WHERE id=?", (new_name, prod['id']))
+            with col_img:
+                if prod['image_url']:
+                    st.image(prod['image_url'], use_container_width=True)
+                else:
+                    st.markdown("🖼️\n*No Image*")
+
+            with col_main:
+                st.subheader(f"{'✅ ' if show_bought else ''}{prod['name']}")
+                st.caption(f"{prod['cat_name']} | {prod['description']}")
+                if prod['target_price'] > 0:
+                    st.write(f"🎯 Target: **₱{prod['target_price']:,.2f}**")
+
+            with col_btns:
+                # Row of action buttons using popovers for cleanliness
+                btn_edit, btn_bought, btn_del = st.columns(3)
+                
+                with btn_edit.popover("📝"):
+                    new_name = st.text_input("Edit Name", value=prod['name'], key=f"ed_n_{prod['id']}")
+                    if st.button("Save", key=f"s_n_{prod['id']}"):
+                        conn.execute("UPDATE products SET name=? WHERE id=?", (new_name, prod['id']))
+                        conn.commit()
+                        st.rerun()
+
+                if not show_bought:
+                    with btn_bought.popover("✔️"):
+                        f_p = st.number_input("Final Paid", value=0.0, key=f"fp_{prod['id']}")
+                        f_s = st.number_input("Shipping", value=0.0, key=f"fs_{prod['id']}")
+                        if st.button("Confirm", key=f"c_{prod['id']}"):
+                            conn.execute("UPDATE products SET is_bought=1, final_paid=?, shipping_fee=? WHERE id=?", (f_p, f_s, prod['id']))
+                            conn.commit()
+                            st.rerun()
+                
+                if btn_del.button("🗑️", key=f"d_{prod['id']}"):
+                    conn.execute("DELETE FROM products WHERE id=?", (prod['id'],))
                     conn.commit()
                     st.rerun()
 
-            if not show_bought:
-                with h2.popover("✔️ Bought"):
-                    f_p = st.number_input("Final Paid", value=0.0, key=f"fp_{prod['id']}")
-                    f_s = st.number_input("Shipping", value=0.0, key=f"fs_{prod['id']}")
-                    if st.button("Confirm", key=f"c_{prod['id']}"):
-                        conn.execute("UPDATE products SET is_bought=1, final_paid=?, shipping_fee=? WHERE id=?", (f_p, f_s, prod['id']))
-                        conn.commit()
-                        st.rerun()
-            
-            if h3.button("🗑️", key=f"d_{prod['id']}"):
-                conn.execute(f"DELETE FROM products WHERE id={prod['id']}")
-                conn.commit()
-                st.rerun()
-
-            l_df = pd.read_sql_query(f"SELECT * FROM listings WHERE product_id={prod['id']} ORDER BY price ASC", conn)
+            # --- Listings Table ---
+            l_df = pd.read_sql_query("SELECT * FROM listings WHERE product_id=? ORDER BY price ASC", conn, params=(prod['id'],))
             if not l_df.empty:
                 def check_stale(d):
-                    diff = (datetime.now() - datetime.strptime(d, "%Y-%m-%d")).days
-                    return f"🔴 {d} ({diff}d ago)" if diff > 7 else f"🟢 {d}"
+                    try:
+                        diff = (datetime.now() - datetime.strptime(d, "%Y-%m-%d")).days
+                        return f"🔴 {d} ({diff}d ago)" if diff > 7 else f"🟢 {d}"
+                    except: return d
+                
                 l_df['last_updated'] = l_df['last_updated'].apply(check_stale)
                 
                 st.dataframe(
@@ -194,8 +229,9 @@ elif page == "📊 Dashboard":
                     hide_index=True, use_container_width=True
                 )
 
-                h_df = pd.read_sql_query(f"SELECT date, price, shop_name FROM history WHERE product_id={prod['id']} ORDER BY date ASC", conn)
+                # --- History Chart ---
+                h_df = pd.read_sql_query("SELECT date, price, shop_name FROM history WHERE product_id=? ORDER BY date ASC", conn, params=(prod['id'],))
                 if len(h_df) > 1:
-                    st.write("**Price Trend**")
-                    chart_data = h_df.pivot_table(index='date', columns='shop_name', values='price')
-                    st.line_chart(chart_data)
+                    with st.expander("📈 View Price Trend"):
+                        chart_data = h_df.pivot_table(index='date', columns='shop_name', values='price')
+                        st.line_chart(chart_data)
