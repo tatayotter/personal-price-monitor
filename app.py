@@ -10,7 +10,6 @@ def init_db():
     conn = sqlite3.connect('price_monitor_v5.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
-    # Added image_url column to products
     c.execute('''CREATE TABLE IF NOT EXISTS products 
                  (id INTEGER PRIMARY KEY, name TEXT, description TEXT, 
                   image_url TEXT, category_id INTEGER)''')
@@ -27,7 +26,7 @@ def get_incoming_data():
         "name": params.get("name", ""),
         "url": params.get("url", ""),
         "price": params.get("price", "0"),
-        "img": params.get("img", "") # New Image Parameter
+        "img": params.get("img", "")
     }
 
 # --- 3. UI CONFIG ---
@@ -35,7 +34,6 @@ st.set_page_config(page_title="PricePro Visual", layout="wide")
 conn = init_db()
 inc = get_incoming_data()
 
-# Clean incoming price
 try:
     clean_p = float(re.search(r"[\d,.]+", inc['price']).group().replace(',', ''))
 except:
@@ -73,8 +71,8 @@ with tab2:
     if target_prod == "(Create New Product)":
         col1, col2 = st.columns(2)
         prod_name = col1.text_input("Master Name", value=inc['name'])
-        prod_img = col1.text_input("Image URL", value=inc['img'])
-        if prod_img: st.image(prod_img, width=150)
+        prod_img = col1.text_input("Image URL (Paste clean link if overlay appeared)", value=inc['img'])
+        if prod_img: st.image(prod_img, width=200, caption="Image Preview")
         
         prod_desc = col2.text_area("Description")
         cats = pd.read_sql_query("SELECT * FROM categories", conn)
@@ -83,12 +81,11 @@ with tab2:
     else:
         p_info = prods_df[prods_df['id'] == prod_map[target_prod]].iloc[0]
         prod_name, cat_id, prod_img = p_info['name'], p_info['category_id'], p_info['image_url']
-        st.info(f"Adding listing to: **{prod_name}**")
-        if prod_img: st.image(prod_img, width=100)
+        st.info(f"Adding listing to existing: **{prod_name}**")
+        if prod_img: st.image(prod_img, width=150)
 
     st.divider()
     
-    # Store Details
     detected_store = "Lazada" if "lazada" in inc['url'].lower() else "Shopee" if "shopee" in inc['url'].lower() else "Shop"
     c_a, c_b, c_c = st.columns([1, 2, 1])
     store = c_a.text_input("Store", value=detected_store)
@@ -112,38 +109,36 @@ with tab2:
             c.execute("INSERT INTO listings (product_id, shop_name, price, url, last_updated) VALUES (?,?,?,?,?)", (p_id, store, price, link, today))
         
         conn.commit()
-        st.success("Saved!")
+        st.success("Successfully Saved!")
         st.query_params.clear()
 
 # --- TAB 1: DASHBOARD ---
 with tab1:
-    search = st.text_input("🔍 Search Dashboard...")
+    search = st.text_input("🔍 Search Items...")
     query = "SELECT p.*, c.name as cat_name FROM products p LEFT JOIN categories c ON p.category_id = c.id"
     if search: query += f" WHERE p.name LIKE '%{search}%'"
     
     display_df = pd.read_sql_query(query, conn)
     
-    # Layout with columns for the cards
     cols = st.columns(3)
     for i, prod in display_df.iterrows():
         with cols[i % 3]:
             with st.container(border=True):
-                # Display Product Photo
                 if prod['image_url']:
                     st.image(prod['image_url'], use_container_width=True)
                 
                 st.subheader(prod['name'])
                 st.caption(f"📁 {prod['cat_name']}")
                 
-                # Listing Details
                 list_df = pd.read_sql_query(f"SELECT * FROM listings WHERE product_id={prod['id']} ORDER BY price ASC", conn)
                 if not list_df.empty:
-                    st.metric("Lowest Price", f"₱{list_df.iloc[0]['price']:,.2f}")
+                    st.metric("Best Price", f"₱{list_df.iloc[0]['price']:,.2f}")
+                    st.divider()
                     for _, lst in list_df.iterrows():
                         st.write(f"**{lst['shop_name']}**: ₱{lst['price']:,.2f}")
-                        st.link_button(f"Go to {lst['shop_name']}", lst['url'])
+                        st.link_button(f"Go to {lst['shop_name']}", lst['url'], use_container_width=True)
                 
-                if st.button("🗑️ Delete", key=f"del_{prod['id']}"):
+                if st.button("🗑️ Delete Product", key=f"del_{prod['id']}"):
                     conn.execute(f"DELETE FROM products WHERE id={prod['id']}")
                     conn.execute(f"DELETE FROM listings WHERE product_id={prod['id']}")
                     conn.commit()
