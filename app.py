@@ -7,7 +7,7 @@ from difflib import get_close_matches
 
 # --- 1. DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect('price_monitor_v18.db', check_same_thread=False)
+    conn = sqlite3.connect('price_monitor_v19.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
     c.execute('''CREATE TABLE IF NOT EXISTS products 
@@ -21,6 +21,7 @@ def init_db():
                  (id INTEGER PRIMARY KEY, product_id INTEGER, shop_name TEXT, 
                   price REAL, date TEXT)''')
     
+    # Prepopulate default categories
     default_cats = ["Tech & Gadgets", "Home & Living", "Health & Beauty", "Groceries", "Fashion"]
     for cat in default_cats:
         c.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
@@ -28,7 +29,7 @@ def init_db():
     return conn
 
 conn = init_db()
-st.set_page_config(page_title="PricePro v18", layout="wide")
+st.set_page_config(page_title="PricePro v19", layout="wide")
 
 # --- 2. CAPTURE URL PARAMETERS ---
 params = st.query_params
@@ -61,7 +62,9 @@ if page == "📁 Categories":
         if c_col2.button("🗑️ Remove", key=f"cat_del_{row['id']}", use_container_width=True):
             usage = pd.read_sql_query(f"SELECT id FROM products WHERE category_id={row['id']}", conn)
             if not usage.empty: st.error("Category in use!")
-            else: conn.execute(f"DELETE FROM categories WHERE id={row['id']}"); conn.commit(); st.rerun()
+            else: 
+                conn.execute(f"DELETE FROM categories WHERE id={row['id']}")
+                conn.commit(); st.rerun()
 
 # --- PAGE: ADD/UPDATE ---
 elif page == "➕ Add/Update Listing":
@@ -69,7 +72,10 @@ elif page == "➕ Add/Update Listing":
     prods_df = pd.read_sql_query("SELECT * FROM products WHERE is_bought=0", conn)
     prod_map = dict(zip(prods_df['name'], prods_df['id']))
     
-    best_match = get_close_matches(inc['name'], list(prod_map.keys()), n=1, cutoff=0.2)[0] if inc['name'] and prod_map else None
+    # --- SAFE FUZZY MATCHING (FIXED INDEXERROR) ---
+    matches = get_close_matches(inc['name'], list(prod_map.keys()), n=1, cutoff=0.2) if inc['name'] and prod_map else []
+    best_match = matches[0] if matches else None
+
     target_prod = st.selectbox("Assign to Product Folder", ["(Create New Product)"] + list(prod_map.keys()),
                                 index=list(prod_map.keys()).index(best_match) + 1 if best_match else 0)
     
@@ -79,7 +85,8 @@ elif page == "➕ Add/Update Listing":
         target_val = col1.number_input("Target Price (Goal)", value=0.0)
         prod_desc = col2.text_area("Notes / Specs")
         cats = pd.read_sql_query("SELECT * FROM categories", conn)
-        cat_selection = col2.selectbox("Category", options=cats['name'].tolist() if not cats.empty else ["None"])
+        cat_options = cats['name'].tolist() if not cats.empty else ["None"]
+        cat_selection = col2.selectbox("Category", options=cat_options)
         cat_id = pd.read_sql_query(f"SELECT id FROM categories WHERE name='{cat_selection}'", conn).iloc[0][0] if not cats.empty else None
     else:
         p_info = prods_df[prods_df['id'] == prod_map[target_prod]].iloc[0]
@@ -92,11 +99,14 @@ elif page == "➕ Add/Update Listing":
     store = ca.text_input("Store Name", value=store_val)
     link = cb.text_input("URL", value=inc['url'])
     
-    try: p_val = float(re.sub(r'[^\d.]', '', inc['price'].replace(',','')))
-    except: p_val = 0.0
+    try: 
+        p_val = float(re.sub(r'[^\d.]', '', inc['price'].replace(',','')))
+    except: 
+        p_val = 0.0
     
     price = cc.number_input("Current Price", value=p_val, min_value=0.0, step=0.01)
 
+    # REJECT ZERO PRICE
     if price <= 0:
         st.warning("⚠️ Price must be greater than zero to save.")
         save_disabled = True
@@ -155,7 +165,7 @@ elif page == "📊 Dashboard":
 
             l_df = pd.read_sql_query(f"SELECT * FROM listings WHERE product_id={prod['id']} ORDER BY price ASC", conn)
             if not l_df.empty:
-                # 1. PRICE TABLE
+                # STALE CHECK
                 def check_stale(d):
                     diff = (datetime.now() - datetime.strptime(d, "%Y-%m-%d")).days
                     return f"🔴 {d} ({diff}d ago)" if diff > 7 else f"🟢 {d}"
@@ -167,10 +177,9 @@ elif page == "📊 Dashboard":
                     hide_index=True, use_container_width=True
                 )
 
-                # 2. RESTORED GRAPH LOGIC
+                # PRICE HISTORY CHART
                 h_df = pd.read_sql_query(f"SELECT date, price, shop_name FROM history WHERE product_id={prod['id']} ORDER BY date ASC", conn)
                 if len(h_df) > 1:
                     st.write("**Price Trend**")
-                    # Pivot the data so each shop has its own line
                     chart_data = h_df.pivot_table(index='date', columns='shop_name', values='price')
                     st.line_chart(chart_data)
