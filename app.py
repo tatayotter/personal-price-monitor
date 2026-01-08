@@ -7,12 +7,13 @@ from difflib import get_close_matches
 
 # --- 1. DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect('price_monitor_v9.db', check_same_thread=False)
+    conn = sqlite3.connect('price_monitor_v11.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
     c.execute('''CREATE TABLE IF NOT EXISTS products 
                  (id INTEGER PRIMARY KEY, name TEXT, description TEXT, 
-                  category_id INTEGER, target_price REAL DEFAULT 0, is_bought INTEGER DEFAULT 0)''')
+                  category_id INTEGER, target_price REAL DEFAULT 0, 
+                  is_bought INTEGER DEFAULT 0, final_paid REAL DEFAULT 0, shipping_fee REAL DEFAULT 0)''')
     c.execute('''CREATE TABLE IF NOT EXISTS listings 
                  (id INTEGER PRIMARY KEY, product_id INTEGER, shop_name TEXT, 
                   price REAL, url TEXT, last_updated TEXT)''')
@@ -22,10 +23,10 @@ def init_db():
     conn.commit()
     return conn
 
-# --- 2. LOGIC ---
 conn = init_db()
-st.set_page_config(page_title="PricePro Personal", layout="wide")
+st.set_page_config(page_title="PricePro v11", layout="wide")
 
+# --- 2. DATA INGESTION ---
 inc = {
     "name": st.query_params.get("name", ""),
     "url": st.query_params.get("url", ""),
@@ -60,25 +61,24 @@ with tab2:
     if target_prod == "(Create New Product)":
         col1, col2 = st.columns(2)
         prod_name = col1.text_input("Master Product Name", value=inc['name'])
-        target_val = col1.number_input("Target Price (Buy when it hits this)", value=0.0)
+        target_val = col1.number_input("Target Price (Buy goal)", value=0.0)
         prod_desc = col2.text_area("Notes")
         cats = pd.read_sql_query("SELECT * FROM categories", conn)
-        cat_id = pd.read_sql_query(f"SELECT id FROM categories WHERE name='{col2.selectbox('Category', options=cats['name'].tolist() if not cats.empty else ['None'])}'", conn).iloc[0][0] if not cats.empty else None
+        cat_selection = col2.selectbox("Category", options=cats['name'].tolist() if not cats.empty else ["None"])
+        cat_id = pd.read_sql_query(f"SELECT id FROM categories WHERE name='{cat_selection}'", conn).iloc[0][0] if not cats.empty else None
     else:
         p_info = prods_df[prods_df['id'] == prod_map[target_prod]].iloc[0]
-        prod_name = p_info['name']
-        target_val = p_info['target_price']
+        prod_name, target_val = p_info['name'], p_info['target_price']
 
     st.divider()
     ca, cb, cc = st.columns([1, 2, 1])
     store = ca.text_input("Store Name", value="Lazada" if "lazada" in inc['url'].lower() else "Shopee" if "shopee" in inc['url'].lower() else "Shop")
     link = cb.text_input("URL", value=inc['url'])
-    # Parse incoming price string safely
     try: p_val = float(re.sub(r'[^\d.]', '', inc['price'].replace(',','')))
     except: p_val = 0.0
     price = cc.number_input("Current Price", value=p_val)
     
-    if st.button("🚀 Save and Update Dashboard"):
+    if st.button("🚀 Save and Update"):
         today = datetime.now().strftime("%Y-%m-%d")
         c = conn.cursor()
         if target_prod == "(Create New Product)":
@@ -94,23 +94,34 @@ with tab2:
 
 # --- TAB 1: DASHBOARD ---
 with tab1:
-    # 1. SUMMARY STATS
-    all_active = pd.read_sql_query("""
+    # 1. SUMMARY STATS (Updated for Voucher Savings)
+    active_summary = pd.read_sql_query("""
         SELECT MIN(l.price) as best, MAX(l.price) as worst 
         FROM listings l JOIN products p ON l.product_id = p.id 
         WHERE p.is_bought=0 GROUP BY p.id""", conn)
     
-    bought_data = pd.read_sql_query("SELECT MIN(price) as spent FROM listings JOIN products ON listings.product_id = products.id WHERE products.is_bought=1 GROUP BY products.id", conn)
+    # Calculate voucher savings: (Lowest Listed Price at time of buy - Final Paid)
+    bought_query = """
+        SELECT p.id, p.final_paid, p.shipping_fee, MIN(l.price) as last_best_list
+        FROM products p 
+        LEFT JOIN listings l ON p.id = l.product_id
+        WHERE p.is_bought=1 GROUP BY p.id
+    """
+    bought_df = pd.read_sql_query(bought_query, conn)
+    
+    total_spent = (bought_df['final_paid'] + bought_df['shipping_fee']).sum()
+    voucher_savings = (bought_df['last_best_list'] - bought_df['final_paid']).sum()
 
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Total Watchlist Value", f"₱{all_active['best'].sum():,.2f}")
-    s2.metric("Money Saved (vs Max)", f"₱{(all_active['worst'] - all_active['best']).sum():,.2f}")
-    s3.metric("Total Already Spent", f"₱{bought_data['spent'].sum():,.2f}")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Watchlist Value", f"₱{active_summary['best'].sum():,.2f}")
+    s2.metric("Market Savings", f"₱{(active_summary['worst'] - active_summary['best']).sum():,.2f}", help="Savings from choosing the cheapest store")
+    s3.metric("Total Spent", f"₱{total_spent:,.2f}")
+    s4.metric("Voucher Savings", f"₱{max(0, voucher_savings):,.2f}", help="Savings from vouchers/promos vs. lowest store price")
     st.divider()
 
     # 2. PRODUCT LIST
-    search = st.text_input("🔍 Search Active Items...")
-    show_bought = st.checkbox("Show Purchased History")
+    search = st.text_input("🔍 Search Items...")
+    show_bought = st.checkbox("Show Purchased Archive")
     
     status = 1 if show_bought else 0
     query = f"SELECT p.*, c.name as cat_name FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.is_bought={status}"
@@ -125,20 +136,29 @@ with tab1:
             h1.caption(f"{prod['cat_name']} | {prod['description']}")
             
             if not show_bought:
-                if h2.button("✔️ Bought", key=f"b_{prod['id']}"):
-                    conn.execute(f"UPDATE products SET is_bought=1 WHERE id={prod['id']}"); conn.commit(); st.rerun()
+                with h2.popover("✔️ Bought"):
+                    st.write("🎉 Checkout Details")
+                    f_price = st.number_input("Final Price (with Vouchers)", value=0.0, key=f"fp_{prod['id']}")
+                    f_ship = st.number_input("Shipping Fee", value=0.0, key=f"fs_{prod['id']}")
+                    if st.button("Confirm", key=f"conf_{prod['id']}"):
+                        conn.execute("UPDATE products SET is_bought=1, final_paid=?, shipping_fee=? WHERE id=?", 
+                                     (f_price, f_ship, prod['id']))
+                        conn.commit()
+                        st.rerun()
             
             if h3.button("🗑️ Del", key=f"d_{prod['id']}"):
                 conn.execute(f"DELETE FROM products WHERE id={prod['id']}"); conn.commit(); st.rerun()
             
+            if show_bought:
+                v_saved = prod['target_price'] - prod['final_paid'] if prod['target_price'] > 0 else 0
+                st.write(f"💸 **Paid:** ₱{prod['final_paid']:,.2f} | **Ship:** ₱{prod['shipping_fee']:,.2f}")
+
             l_df = pd.read_sql_query(f"SELECT * FROM listings WHERE product_id={prod['id']} ORDER BY price ASC", conn)
             if not l_df.empty:
-                # Target Price Logic
-                best = l_df.iloc[0]['price']
-                if prod['target_price'] > 0 and best <= prod['target_price']:
-                    st.success(f"🎯 TARGET MET: Price is below your ₱{prod['target_price']:,.2f} goal!")
+                best_price = l_df.iloc[0]['price']
+                if not show_bought and prod['target_price'] > 0 and best_price <= prod['target_price']:
+                    st.success(f"🎯 TARGET MET: Current Price ₱{best_price:,.2f} is under your ₱{prod['target_price']:,.2f} goal!")
 
-                # Listings and Graph
                 st.dataframe(l_df[['shop_name', 'price', 'last_updated']], hide_index=True, use_container_width=True)
                 
                 h_df = pd.read_sql_query(f"SELECT date, price, shop_name FROM history WHERE product_id={prod['id']} ORDER BY date ASC", conn)
